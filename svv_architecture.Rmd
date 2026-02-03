@@ -1,0 +1,681 @@
+---
+author: Collin McNeil
+output: html_document
+---
+
+# App Architecture Guide: Understanding the SYNGAP1 Variant Viewer
+
+## Table of Contents
+1. [Big Picture Overview](#big-picture-overview)
+2. [Design Philosophy](#design-philosophy)
+3. [Data Flow Diagram](#data-flow-diagram)
+4. [Component Breakdown](#component-breakdown)
+5. [Key Design Decisions](#key-design-decisions)
+6. [Development Timeline (How the App Was Built)](#development-timeline)
+7. [Common Patterns Used](#common-patterns-used)
+
+---
+
+## Big Picture Overview
+
+### What Problem Does This App Solve?
+
+**Problem:**
+Clinical geneticists have identified 153 SYNGAP1 gene variants across patient populations, but:
+- Variant data is scattered across spreadsheets
+- Hard to visualize variant locations on the gene
+- No easy way to find variants with research resources (biosamples, cell lines, mouse models)
+- cDNA notation is relative to transcript, but visualization requires genome coordinates
+
+**Solution:**
+An interactive web app that:
+1. Displays all variants on an actual genome browser (IGV)
+2. Groups variants by type (missense, nonsense, frameshift, etc.)
+3. Filters by available research resources
+4. Automatically converts cDNA coordinates to genome positions
+5. Runs in any web browser (no installation for end users)
+
+---
+
+## Design Philosophy
+
+### Core Principles That Guided Development
+
+#### 1. **Separation of Concerns**
+```
+DATA LAYER       → Load, parse, transform, cache
+BUSINESS LOGIC   → Filter, format, compute
+PRESENTATION     → Display, interact, visualize
+```
+
+**Why:** Each layer can be modified independently. Data changes don't break UI. UI redesign doesn't affect data processing.
+
+#### 2. **Performance Through Preprocessing**
+```
+Do expensive work ONCE at startup
+   ↓
+   Parse variants
+   Query API
+   Cache results
+   Format data
+   ↓
+User interactions are INSTANT
+```
+
+**Why:** Users don't wait for data processing during interactions. App feels responsive.
+
+#### 3. **Reactive Programming**
+```
+User changes filter
+   ↓ (automatic)
+Data re-filtered
+   ↓ (automatic)
+UI updates
+   ↓ (automatic)
+Tracks refresh
+```
+
+**Why:** No manual update logic. No bugs from forgetting to update something. Declarative code.
+
+#### 4. **Fail Gracefully**
+```
+Variant has no coordinate? → Skip it, continue
+API call fails? → Return NA, don't crash
+Filter removes all data? → Show empty track, explain
+```
+
+**Why:** Real-world data is messy. App should handle edge cases without breaking.
+
+#### 5. **Cache Everything Expensive**
+```
+API calls → Cached to disk (permanent)
+Parsed data → Computed once (session)
+Filtered data → Reactive (auto-cached)
+```
+
+**Why:** 150x performance improvement. Works offline. Reduces server load.
+
+---
+
+## Data Flow Diagram
+
+### Startup Sequence
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ APP STARTUP (Happens Once)                                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+1. Load Libraries
+   ├─ shiny, igvShiny, dplyr, stringr, httr, jsonlite, memoise
+   └─ Why: Each provides specific functionality
+
+2. Load CSV Data (updatedCitizen191.csv)
+   ├─ 153 variants × 33 columns
+   └─ stringsAsFactors = FALSE for flexibility
+
+3. Clean Variant Types
+   ├─ "missense VUS" → "missense-VUS"
+   ├─ "frameshift deletion" → "frameshift"  
+   └─ Ensures consistent naming
+
+4. Extract cDNA Coordinates
+   ├─ "c.333del" → 333
+   ├─ "c.190_200del" → 190
+   └─ Uses regex parsing
+
+5. Convert Coordinates to Genome Positions
+   ├─ Query Ensembl API (with caching!)
+   ├─ cDNA 333 → chr6:33,425,796
+   ├─ First run: 143 API calls (~40 sec)
+   └─ Later runs: 143 cache reads (~0.3 sec)
+
+6. Format Protein Changes
+   ├─ "p.R135X" → "Arg135ter"
+   └─ Three-letter codes more readable
+
+7. Merge Everything
+   ├─ Original data + coordinates + formatted names
+   └─ Complete dataset ready for visualization
+
+8. Start Web Server
+   ├─ Initialize UI
+   ├─ Initialize IGV browser
+   └─ Wait for user interaction
+```
+
+### User Interaction Sequence
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ USER INTERACTION (Reactive)                                         │
+└─────────────────────────────────────────────────────────────────────┘
+
+Scenario 1: User clicks "missense" button
+────────────────────────────────────────
+1. observeEvent fires
+2. Update added_tracks state (missense = TRUE)
+3. Get filtered_data() (respects any active filters)
+4. Filter for variant.type == "missense"
+5. Convert to GFF3 format
+6. Load track into IGV
+7. Center view on SYNGAP1 gene
+8. Track appears on screen
+
+Scenario 2: User checks "Has biorepository samples"
+─────────────────────────────────────────────────────
+1. Checkbox input changes
+2. filtered_data() reactive recalculates
+   ├─ Start with all variants
+   ├─ Filter: biorepository column has data
+   └─ Return subset
+3. trackButtons UI regenerates (different variant types available)
+4. observeEvent for filtered_data() fires
+5. All visible tracks reload with filtered data
+6. IGV updates (some variants disappear)
+
+Scenario 3: User checks "Cell line available" too
+──────────────────────────────────────────────────
+1. Second checkbox changes
+2. filtered_data() reactive recalculates again
+   ├─ Start with all variants
+   ├─ Filter: biorepository column has data (AND)
+   ├─ Filter: iPSC.line column has data (AND)
+   └─ Return smaller subset (intersection)
+3. Tracks reload with even fewer variants
+4. UI shows only variants with BOTH resources
+```
+
+---
+
+## Component Breakdown
+
+### Layer 1: Data Processing (Lines 1-172)
+
+**Purpose:** Transform raw CSV into visualization-ready format
+
+**Components:**
+
+1. **Amino Acid Converter** (`swap_one_letter_to_three_letter`)
+   - Input: `"R135X"`
+   - Output: `"Arg135ter"`
+   - Why: Readability for biologists
+
+2. **Coordinate Extractor** (`extract_cDNA_coordinate`)
+   - Input: `"c.333del"`
+   - Output: `333`
+   - Why: Need numeric value for API query
+
+3. **API Client** (`get_genome_positions_function`)
+   - Input: cDNA coordinate `333`
+   - Output: `list(seqid="chr6", start=33425796, end=33425796)`
+   - Why: IGV needs genome coordinates, not cDNA
+
+4. **Cache Wrapper** (`memoise`)
+   - Wraps: `get_genome_positions_function`
+   - Effect: Saves results to disk, reads from disk on subsequent calls
+   - Why: 150x performance boost, offline capability
+
+5. **Data Loader**
+   - Reads CSV
+   - Normalizes variant types
+   - Extracts coordinates
+   - Queries API (or cache)
+   - Merges results
+   - Creates complete dataset
+
+### Layer 2: User Interface (Lines 187-229)
+
+**Purpose:** Visual layout and controls
+
+**Components:**
+
+1. **Title Bar**
+   - Shows app name
+   - Professional appearance
+
+2. **Sidebar Panel**
+   - Dynamic variant type buttons (generated by server)
+   - Three filter checkboxes (static)
+   - Compact width (30% of screen)
+
+3. **Main Panel**
+   - IGV browser widget
+   - Large display area (70% of screen)
+   - 700px height for multiple tracks
+
+4. **Footer**
+   - Citation for igvShiny tool
+   - Centered, small font
+
+**Layout Choice:**
+```
+┌────────────────────────────────────────┐
+│         SYNGAP1 Variant Viewer         │
+├──────────────┬─────────────────────────┤
+│              │                         │
+│  [missense]  │                         │
+│  [nonsense]  │      IGV Browser        │
+│  [frameshift]│      (Genome View)      │
+│              │                         │
+│  □ Biorepository                       │
+│  □ Cell line │                         │
+│  □ Mouse line│                         │
+│              │                         │
+└──────────────┴─────────────────────────┘
+  30% width         70% width
+```
+
+### Layer 3: Server Logic (Lines 266-398)
+
+**Purpose:** Reactive programming that connects UI to data
+
+**Components:**
+
+1. **State Manager** (`added_tracks`)
+   - Tracks which buttons user has clicked
+   - Persists across filter changes
+   - Type: `reactiveVal(list())`
+
+2. **Data Filter** (`filtered_data`)
+   - Reactive expression
+   - Recomputes when any filter checkbox changes
+   - Returns: Subset of variant_data matching all active filters
+
+3. **Button Generator** (`output$trackButtons`)
+   - Reactive UI
+   - Creates buttons based on filtered variant types
+   - Updates when filters change
+
+4. **Track Loader** (`observe` with button events)
+   - Listens for button clicks
+   - Converts data to GFF3 format
+   - Loads track into IGV
+   - Handles empty data gracefully
+
+5. **Track Updater** (`observeEvent(filtered_data())`)
+   - Watches for filter changes
+   - Reloads all visible tracks with new filtered data
+   - Keeps display in sync with filters
+
+6. **IGV Initializer** (`output$igvShiny_0`)
+   - Sets up genome browser on startup
+   - Configures genome (hg38)
+   - Sets initial view (SYNGAP1)
+   - Starts with no tracks
+
+---
+
+## Key Design Decisions
+
+### Decision 1: When to Process Data?
+
+**Options:**
+- A) Process data when user requests it (lazy loading)
+- B) Process all data at startup (eager loading)
+
+**Chosen: B (Eager Loading)**
+
+**Rationale:**
+- Dataset is small (153 variants)
+- Startup delay acceptable (~1 second with cache)
+- User interactions must be instant
+- Simpler code (no loading states)
+- Better UX (no waiting during use)
+
+**Trade-off:** Longer startup vs instant interactions → Choose instant interactions
+
+---
+
+### Decision 2: How to Handle API Rate Limits?
+
+**Options:**
+- A) Make API calls on-demand as user clicks
+- B) Prefetch all coordinates at startup
+- C) Cache results permanently to disk
+
+**Chosen: B + C (Prefetch + Permanent Cache)**
+
+**Rationale:**
+- 143 coordinates under 15 req/sec limit
+- First run builds permanent cache
+- Later runs use cache (offline capable)
+- No network dependency after first run
+- Works behind firewalls
+
+**Trade-off:** First run delay vs long-term reliability → Choose reliability
+
+---
+
+### Decision 3: What Happens When Filters Remove All Data?
+
+**Options:**
+- A) Hide the track completely
+- B) Show empty track with message
+- C) Disable the button
+
+**Chosen: B (Show Empty Track)**
+
+**Rationale:**
+- User feedback (track exists, just filtered out)
+- Consistent behavior (all clicks do something)
+- Less confusing than disappearing tracks
+- Easy to understand why track is empty
+
+**Trade-off:** Visual clutter vs clarity → Choose clarity
+
+---
+
+### Decision 4: How to Structure Filter Logic?
+
+**Options:**
+- A) OR logic (any filter matches)
+- B) AND logic (all filters match)
+- C) Complex boolean logic
+
+**Chosen: B (AND Logic)**
+
+**Rationale:**
+- "Show variants with biorepository AND cell line"
+- Natural interpretation
+- Most useful for research planning
+- Simple to implement
+- Easy to explain to users
+
+**Trade-off:** Flexibility vs simplicity → Choose simplicity
+
+---
+
+### Decision 5: Where to Store Genome Positions?
+
+**Options:**
+- A) In CSV file
+- B) Query API each time
+- C) Cache in memory
+- D) Cache on disk permanently
+
+**Chosen: D (Disk Cache) with path to migrate to A**
+
+**Current Approach:**
+```
+CSV → Extract coords → Check cache → (API if needed) → Display
+```
+
+**Better Future Approach:**
+```
+Enhanced CSV (with positions) → Display
+```
+
+**Rationale:**
+- Current: Good enough, works now
+- Future: Simpler, faster, more reliable
+- Migration path: Extract cache → CSV → Remove API code
+
+---
+
+## Development Timeline (How the App Was Built)
+
+### Phase 1: Prototype (The "desktop" File)
+```
+Goal: Prove concept
+Approach: Hardcode everything
+Result: 160 hardcoded positions, single track
+Learning: IGV integration works!
+```
+
+**Code:**
+```r
+startPathogenic <- c(33420307, 33420332, ...)  # 160 positions
+loadBedTrack(..., tbl=tbl.pathogenic, color="red")
+```
+
+**Limitations:**
+- Can't add new variants without editing code
+- No filtering
+- No variant type distinction
+- Not maintainable
+
+### Phase 2: Data-Driven Design
+```
+Goal: Load from CSV
+Approach: Read updatedCitizen191.csv
+Result: Dynamic variant loading
+Learning: Need coordinate conversion!
+```
+
+**Challenge:** CSV has cDNA coordinates, IGV needs genome coordinates
+
+**Solution:** Ensembl REST API
+
+### Phase 3: API Integration
+```
+Goal: Convert coordinates automatically
+Approach: Query Ensembl API
+Result: Working but slow (40 seconds startup)
+Learning: Need caching!
+```
+
+**Problem:**
+```
+143 variants × 300ms per API call = 42,900ms = 43 seconds
+```
+
+**Unacceptable for production app**
+
+### Phase 4: Performance Optimization
+```
+Goal: Fast loading
+Approach: Memoization with disk cache
+Result: 0.3 second startup after first run
+Learning: Cache is essential!
+```
+
+**Implementation:**
+```r
+get_genome_positions <- memoise(get_genome_positions_function,
+                                cache = cachem::cache_disk("cache/genome_positions"))
+```
+
+**Performance:**
+```
+Before: 43 seconds every time
+After:  43 seconds first time, 0.3 seconds always after
+Improvement: 150x speedup for typical usage
+```
+
+### Phase 5: Rich UI Features
+```
+Goal: Multiple variant types, filtering
+Approach: Dynamic buttons, reactive filters
+Result: Professional research tool
+Learning: Reactive programming is powerful!
+```
+
+**Added:**
+- Color-coded variant types
+- Dynamic button generation
+- Research asset filters
+- Graceful empty state handling
+- Track updates on filter changes
+
+### Phase 6: Polish & Documentation
+```
+Goal: Production-ready code
+Approach: Comments, error handling, citation
+Result: Maintainable, documented application
+Learning: Documentation is essential!
+```
+
+---
+
+## Common Patterns Used
+
+### Pattern 1: Memoization for Expensive Operations
+```r
+expensive_function <- function(x) {
+  # Complex calculation or API call
+  Sys.sleep(0.3)  # Simulating delay
+  return(x * 2)
+}
+
+# Wrap with memoization
+cached_function <- memoise(expensive_function)
+
+# First call: Slow (0.3 seconds)
+result1 <- cached_function(5)
+
+# Second call: Fast (< 0.001 seconds)
+result2 <- cached_function(5)
+```
+
+**When to use:** Expensive computations with stable results
+
+---
+
+### Pattern 2: Reactive Expression for Derived Data
+```r
+# Reactive expression (automatically updates)
+filtered_data <- reactive({
+  data <- original_data
+  if (input$checkbox) {
+    data <- data %>% filter(...)
+  }
+  data
+})
+
+# Use in outputs/observers
+output$plot <- renderPlot({
+  plot(filtered_data())  # Auto-updates when checkbox changes
+})
+```
+
+**When to use:** Data that depends on user inputs and is used in multiple places
+
+---
+
+### Pattern 3: Closure to Avoid Variable Capture
+```r
+# WRONG - all observers share same 'type'
+for (type in types) {
+  observeEvent(input[[type]], {
+    print(type)  # Always prints last type!
+  })
+}
+
+# RIGHT - each observer gets own 't'
+for (type in types) {
+  local({
+    t <- type  # Capture in local scope
+    observeEvent(input[[t]], {
+      print(t)  # Prints correct type
+    })
+  })
+}
+```
+
+**When to use:** Observers in loops
+
+---
+
+### Pattern 4: Graceful Degradation
+```r
+result <- tryCatch({
+  expensive_operation()
+}, error = function(e) {
+  # Return sensible default instead of crashing
+  return(list(seqid = "chr6", start = NA, end = NA))
+})
+```
+
+**When to use:** External dependencies, network calls, user data
+
+---
+
+### Pattern 5: Separate Validation from Processing
+```r
+# Validation wrapper
+extract_protein_change <- function(protein_change) {
+  if (is.na(protein_change) || protein_change == "") {
+    return(protein_change)  # Handle bad input
+  }
+  swap_one_letter_to_three_letter(protein_change)  # Do work
+}
+
+# Processing function (assumes valid input)
+swap_one_letter_to_three_letter <- function(protein_change_str) {
+  # No validation needed - wrapper handles it
+  # Pure transformation logic
+}
+```
+
+**When to use:** Complex data transformations with edge cases
+
+---
+
+## Summary: The Full Picture
+
+```
+                    SYNGAP1 Variant Viewer
+                           ↓
+        ┌──────────────────┴──────────────────┐
+        │                                     │
+    DATA LAYER                           UI LAYER
+        │                                     │
+   Load CSV ────────────────────────→  Display Controls
+   Parse Variants                       Show IGV Browser
+   Query API (cached!) ←────────────  User Clicks Button
+   Format Data                          User Checks Filter
+        │                                     │
+        └──────────────────┬──────────────────┘
+                           ↓
+                    REACTIVE LAYER
+                   (Shiny Server)
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+   Filter Data      Generate UI        Load Tracks
+   (reactive())   (renderUI())    (observeEvent())
+        │                  │                  │
+        └──────────────────┴──────────────────┘
+                           ↓
+                    User sees updated view
+                    (tracks, filters, data)
+```
+
+**Key Insight:** 
+The app is a pipeline where data flows from CSV → Processing → Cache → Reactive system → IGV display. User interactions trigger reactive updates that flow through the same pipeline, but use cached data for instant response.
+
+**Success Criteria:**
+✅ Fast (< 1 second load time after first run)
+✅ Reliable (handles missing data gracefully)
+✅ Useful (filters help researchers find variants)
+✅ Maintainable (well-documented, modular code)
+✅ Scalable (can handle more variants/filters)
+
+---
+
+## Next Steps for Understanding
+
+1. **Read the commented code** (`app_COMMENTED.R`)
+   - Start at top, read section by section
+   - Each function has detailed explanation
+
+2. **Run the app** and watch the console
+   - See API calls on first run
+   - Notice instant load on second run
+   - Try filters, observe reactive updates
+
+3. **Experiment with modifications**
+   - Add a new filter
+   - Change color scheme
+   - Add a download button
+
+4. **Study the reactive flow**
+   - Open RStudio debugger
+   - Set breakpoints in observers
+   - Watch values change as you interact
+
+5. **Review design decisions**
+   - Understand why each choice was made
+   - Consider alternatives
+   - Think about trade-offs
+
+Good luck! 🧬
