@@ -32,6 +32,7 @@ Developed for **[CURE SYNGAP1](https://curesyngap1.org/)** - a global group of f
 The SYNGAP1 Variant Viewer is a web-based application designed to help researchers visualize and analyze genetic variants in the SYNGAP1 gene. SYNGAP1 variants are associated with neurodevelopmental disorders, and this tool facilitates:
 
 - **Variant visualization** on chromosome 6 using an embedded genome browser
+- **ClinVar integration**: live NCBI ClinVar data fetched automatically and displayed as a toggleable reference track
 - **Filtering by research assets** (biorepository samples, iPSC cell lines, mouse models)
 - **Interactive exploration** with color-coded variant types
 - **Coordinate conversion** from cDNA (transcript-relative) to genomic positions (genome-relative)
@@ -43,6 +44,7 @@ The application currently displays **153 variants** tracked through Citizen Heal
 - **R Shiny**: Web application framework
 - **igvShiny**: R wrapper for Integrative Genomics Viewer
 - **Ensembl REST API**: Genomic coordinate conversion
+- **NCBI E-utilities**: Live ClinVar variant data retrieval
 - **Reactive programming**: Real-time UI updates
 
 ---
@@ -52,6 +54,7 @@ The application currently displays **153 variants** tracked through Citizen Heal
 ### Core Functionality
 
 - ✅ **Interactive Genome Browser**: Embedded IGV displaying variants on chromosome 6
+- ✅ **ClinVar Reference Track**: Toggleable track showing all SYNGAP1 ClinVar submissions, fetched live from NCBI and cached for 7 days; variant size filterable via a log-spaced slider (1–50,000 KB, default 100 KB)
 - ✅ **Multiple Variant Types**: Missense, nonsense, frameshift, indel, intronic, and structural variants
 - ✅ **Dynamic Track Loading**: Add/remove variant tracks by type
 - ✅ **Color-Coded Display**: Each variant type has a distinct color for easy identification
@@ -110,13 +113,15 @@ This will install:
 - `jsonlite` - JSON parsing
 - `memoise` - Function caching
 - `cachem` - Cache management
+- `shinyWidgets` - Extended UI widgets (log-spaced ClinVar size slider)
 
 ### Step 3: Create Cache Directory
 
-The cache directory will be created automatically on first run, but you can create it manually:
+The cache directories will be created automatically on first run, but you can create them manually:
 
 ```r
 dir.create("cache/genome_positions", recursive = TRUE)
+dir.create("cache/clinvar", recursive = TRUE)
 ```
 
 ### Step 4: Run the Application
@@ -152,6 +157,8 @@ The app will open in your default web browser.
 - Click buttons in the left sidebar to add variant type tracks
 - Example: Click "missense" to display all missense variants
 - Each track appears as a horizontal layer in IGV
+- Click **"ClinVar"** (below a separator) to overlay all SYNGAP1 ClinVar submissions as a teal reference track; this track is independent of the research-asset filters
+- Use the **"Max ClinVar variant size"** slider beneath the ClinVar button to control which variants appear by their genomic span. The slider is log-spaced (1–50,000 KB) so you get fine-grained control at the low end (1 KB steps for point variants) and coarser steps at the high end (5,000 KB steps for large CNVs). Default is 100 KB. Moving the slider immediately reloads the track if it is already displayed.
 
 **Step 3: Apply filters (optional)**
 - Check "Has biorepository samples" to show only variants with stored samples
@@ -167,15 +174,18 @@ The app will open in your default web browser.
 ### First Run vs. Subsequent Runs
 
 **First Run** (with internet):
-- Takes ~40-60 seconds
-- Queries Ensembl API to convert cDNA coordinates to genome positions
-- Caches all results to disk in `cache/genome_positions/`
-- Creates ~143 cache files
+- Takes ~70-120 seconds total
+- Queries NCBI E-utilities to fetch all SYNGAP1 ClinVar entries (~30-60 seconds); result cached to `cache/clinvar/` for 7 days
+- Queries Ensembl API to convert cDNA coordinates to genome positions (~40-60 seconds); result cached permanently to `cache/genome_positions/`
 
-**Subsequent Runs** (can be offline):
-- Takes <1 second
-- Reads positions from cache
+**Subsequent Runs within 7 days** (can be offline):
+- Takes <2 seconds
+- Reads both the ClinVar data and genome positions from disk cache
 - No internet required
+
+**After 7 days:**
+- ClinVar cache is considered stale; the app re-fetches from NCBI on startup (~30-60 seconds)
+- Genome position cache is permanent and never needs refreshing
 
 ---
 
@@ -188,6 +198,7 @@ The app follows a three-layer architecture:
 ```
 ┌─────────────────────────────────────────┐
 │ DATA LAYER                              │
+│ • Fetch ClinVar data (NCBI, 7-day cache)│
 │ • Load updatedCitizen191.csv            │
 │ • Parse variant nomenclature            │
 │ • Convert coordinates (API + cache)     │
@@ -198,49 +209,72 @@ The app follows a three-layer architecture:
 │ PRESENTATION LAYER (UI)                 │
 │ • Sidebar controls                      │
 │ • IGV browser widget                    │
-│ • Dynamic button generation             │
+│ • Dynamic variant-type buttons          │
+│ • Static ClinVar track button           │
 └─────────────────┬───────────────────────┘
                   ↓
 ┌─────────────────────────────────────────┐
 │ LOGIC LAYER (Server)                    │
 │ • Reactive filtering                    │
 │ • Track management                      │
-│ • Event handling                        │
+│ • Event handling (incl. ClinVar button) │
 └─────────────────────────────────────────┘
 ```
 
 ### Key Components
 
-**1. Coordinate Conversion**
+**1. ClinVar Data Loading**
+- Source: NCBI E-utilities API (esearch + esummary)
+- Fetch: All SYNGAP1 ClinVar variation IDs, then full metadata in batches of 200
+- Cache: `cache/clinvar/clinvar_data.rds` — expires after 7 days, then re-fetched automatically
+- Fallback: If NCBI is unreachable, app uses stale cache (or loads empty track as last resort)
+- Display: GFF3 track colored teal (#00BCD4); all ClinVar metadata visible on click in IGV
+
+**2. Coordinate Conversion**
 - Input: cDNA notation (e.g., "c.333del")
 - Extraction: Numeric coordinate (333)
 - API Query: Ensembl REST API
 - Output: Genome position (chr6:33,425,796)
 - Caching: Permanent disk storage via `memoise`
 
-**2. Protein Nomenclature Formatting**
+**2. Coordinate Conversion**
+- Input: cDNA notation (e.g., "c.333del")
+- Extraction: Numeric coordinate (333)
+- API Query: Ensembl REST API
+- Output: Genome position (chr6:33,425,796)
+- Caching: Permanent disk storage via `memoise`
+
+**3. Protein Nomenclature Formatting**
 - Converts single-letter amino acid codes to three-letter codes
 - Example: "p.R135X" → "Arg135ter"
 - Improves readability for biologists
 
-**3. Reactive Filtering**
+**4. Reactive Filtering**
 - Filter changes trigger automatic data recalculation
 - Tracks reload with filtered data
 - No manual refresh needed
+- Note: ClinVar track is unaffected by research-asset filters (it is a reference dataset, not internal data)
 
-**4. GFF3 Track Generation**
-- Converts variant data to GFF3 format
+**5. GFF3 Track Generation**
+- Converts both internal variant data and ClinVar data to GFF3 format
 - IGV-compatible genomic feature format
-- Includes attributes: ID, Name, Description, variant count
+- Internal tracks include: ID, Name, Description, variant count
+- ClinVar track includes: all ClinVar metadata fields (germline classification, review status, conditions, etc.)
 
 ### Data Flow
 
 ```
+NCBI E-utilities (esearch + esummary)
+  ↓
+Cache to cache/clinvar/ (7-day expiry)
+  ↓
+[On button click: format as GFF3 → ClinVar track in IGV]
+
 updatedCitizen191.csv
   ↓
 Extract cDNA coordinates
   ↓
-Query Ensembl API (cached)
+Query Ensembl API (permanently cached)
   ↓
 Merge genome positions
   ↓
@@ -267,10 +301,13 @@ syngap1-variant-viewer/
 ├── README.md                       # This file
 ├── updatedCitizen191.csv          # Variant data (153 variants, 33 columns)
 ├── cache/
-│   └── genome_positions/          # API response cache (auto-generated)
-│       ├── [hash1].rds
-│       ├── [hash2].rds
-│       └── ... (~143 files)
+│   ├── genome_positions/          # Ensembl coordinate cache (permanent, auto-generated)
+│   │   ├── [hash1].rds
+│   │   ├── [hash2].rds
+│   │   └── ... (~143 files)
+│   └── clinvar/                   # ClinVar data cache (7-day expiry, auto-generated)
+│       ├── clinvar_data.rds       # Parsed ClinVar data frame
+│       └── last_updated.txt       # ISO timestamp of last successful fetch
 └── LICENSE                        # License file
 ```
 
@@ -310,12 +347,14 @@ syngap1-variant-viewer/
 
 ## Performance & Caching
 
-### Memoization Strategy
+The app maintains two separate caches to avoid redundant network calls.
 
-The app uses **memoization** to cache expensive Ensembl API calls:
+### Ensembl Coordinate Cache (Permanent)
+
+Genomic positions for cDNA coordinates are fetched once from the Ensembl REST API and stored permanently, since hg38 positions never change.
 
 ```r
-# Cached function
+# Permanent memoized cache
 get_genome_positions <- memoise(
   get_genome_positions_function, 
   cache = cachem::cache_disk("cache/genome_positions")
@@ -323,35 +362,59 @@ get_genome_positions <- memoise(
 ```
 
 **How it works:**
-1. First call to `get_genome_positions(333)` queries the API (300ms)
+1. First call to `get_genome_positions(333)` queries the Ensembl API (300ms)
 2. Result saved to `cache/genome_positions/[hash].rds`
-3. Subsequent calls read from disk (2ms) - **150× faster**
-4. Cache persists across R sessions
+3. Subsequent calls read from disk (2ms) — **150× faster**
+4. Cache persists indefinitely across R sessions
+
+### ClinVar Cache (7-Day Expiry)
+
+ClinVar submissions change regularly, so the app re-fetches from NCBI after 7 days.
+
+**How it works:**
+1. On startup, the app checks `cache/clinvar/last_updated.txt`
+2. If cache is < 7 days old, `clinvar_data.rds` is loaded instantly (<1 second)
+3. If cache is absent or expired, the app fetches from NCBI (esearch + esummary, ~30-60 seconds), then saves to `cache/clinvar/`
+4. If the fetch fails but a stale cache exists, the stale cache is used with a warning
+
+**To force a re-fetch before 7 days:**
+```r
+unlink("cache/clinvar/last_updated.txt")
+# Restart the app — it will treat the cache as expired
+```
 
 ### Performance Metrics
 
 | Operation | First Run | Cached Run |
 |-----------|-----------|------------|
-| Single coordinate | 300ms | 2ms |
-| 143 coordinates | ~43 seconds | ~0.3 seconds |
-| Speedup | — | **150×** |
+| Single Ensembl coordinate | 300ms | 2ms |
+| 143 Ensembl coordinates | ~43 seconds | ~0.3 seconds |
+| Ensembl cache speedup | — | **150×** |
+| ClinVar fetch (~1,900 variants) | ~30-60 seconds | <1 second |
 
 ### Cache Management
 
-**When to clear cache:**
+**When to clear the Ensembl cache:**
 - Switched genome builds (hg38 → hg19)
 - Changed transcript IDs
 - Cache corruption
 
-**How to clear:**
 ```r
-# Delete all cache files
+# Delete Ensembl coordinate cache
 unlink("cache/genome_positions/*.rds")
 ```
 
-**Cache size:**
-- ~2KB per variant coordinate
-- 143 variants = ~300KB total (negligible)
+**When to clear the ClinVar cache:**
+- To force an immediate re-fetch before the 7-day window expires
+
+```r
+# Force ClinVar re-fetch on next startup
+unlink("cache/clinvar/last_updated.txt")
+```
+
+**Cache sizes:**
+- Ensembl: ~2KB per coordinate × 143 coordinates ≈ 300KB total
+- ClinVar: ~1-3MB for the full SYNGAP1 entry set (single .rds file)
 
 ---
 
@@ -368,16 +431,25 @@ To update the variant dataset:
 
 The app will automatically:
 - Parse new variants
-- Query API for any new coordinates (or use cache for existing ones)
+- Query Ensembl API for any new coordinates (or use cache for existing ones)
 - Update the visualization
+
+### Updating ClinVar Data
+
+ClinVar data is refreshed automatically every 7 days on startup — no manual action is needed. To force an immediate refresh:
+
+```r
+unlink("cache/clinvar/last_updated.txt")
+# Then restart the app
+```
 
 ### Adding New Variant Types
 
 If your data includes new variant classifications:
 
-1. Add to variant type normalization (lines 131-147 in `svv_app.R`)
-2. Add color to color table (lines 175-185)
-3. No other changes needed - app generates buttons dynamically
+1. Add to variant type normalization (~line 878 in `svv_app.R`)
+2. Add color to color table (~line 1033)
+3. No other changes needed — app generates buttons dynamically
 
 Example:
 ```r
@@ -398,17 +470,19 @@ color_table <- list(
 
 Currently configured for **hg38**. To switch to hg19:
 
-1. Update line 395 in `svv_app.R`: `genomeName = "hg19"`
-2. Clear cache: `unlink("cache/genome_positions/*.rds")`
+1. Update `genomeName = "hg19"` in the `renderIgvShiny` block (~line 1843 in `svv_app.R`)
+2. Clear Ensembl cache: `unlink("cache/genome_positions/*.rds")`
 3. Restart app (will rebuild cache for hg19)
+
+Note: The ClinVar GRCh38 coordinate filter in `create_clinvar_gff3_data` would also need updating if switching builds.
 
 ### Changing Transcript
 
 Currently uses **ENST00000418600** (SYNGAP1 canonical transcript).
 
 To change:
-1. Update line 96 in `svv_app.R`: `transcript_id = "ENST00000XXXXXX"`
-2. Clear cache
+1. Update `transcript_id = "ENST00000XXXXXX"` in the coordinate fetch loop (~line 989 in `svv_app.R`)
+2. Clear Ensembl cache: `unlink("cache/genome_positions/*.rds")`
 3. Restart app
 
 ---
@@ -430,9 +504,34 @@ BiocManager::install("igvShiny")
 
 ---
 
+**Problem: ClinVar track is empty or missing**
+
+**Solution:** This can happen if the NCBI fetch failed on startup and no cache existed. Check the R console for ClinVar-related warnings. Try:
+```r
+unlink("cache/clinvar/last_updated.txt")
+# Then restart the app
+```
+If the problem persists, verify your internet connection and that `https://eutils.ncbi.nlm.nih.gov` is reachable.
+
+---
+
+**Problem: ClinVar track shows outdated data**
+
+**Solution:** The cache refreshes automatically every 7 days. To force an immediate re-fetch:
+```r
+unlink("cache/clinvar/last_updated.txt")
+# Restart the app
+```
+
+---
+
 **Problem: App loads slowly on first run**
 
-**Solution:** This is expected! First run takes ~40-60 seconds to query Ensembl API and build cache. Subsequent runs are <1 second.
+**Solution:** This is expected! First run takes ~70-120 seconds to:
+- Fetch all SYNGAP1 ClinVar entries from NCBI (~30-60 seconds)
+- Query Ensembl API for cDNA→genome coordinate conversion (~40-60 seconds)
+
+Both caches are then stored to disk; subsequent runs start in <2 seconds.
 
 ---
 
@@ -468,8 +567,17 @@ dir.create("cache/genome_positions", recursive = TRUE)
 Enable console logging to track API calls:
 
 During first run, watch for messages like:
-- `"No mapping data found for cDNA coordinate X"` - Coordinate couldn't be mapped (expected for some variants)
-- `"Error fetching genome position for coordinate Y"` - API error (will retry or skip)
+- `"ClinVar: querying NCBI esearch for SYNGAP1 variation IDs..."` — ClinVar fetch started
+- `"ClinVar: found X variation IDs."` — esearch succeeded
+- `"ClinVar: fetching summaries in N batches..."` — esummary batches in progress
+- `"ClinVar: successfully parsed X variant records."` — ClinVar data ready
+- `"ClinVar: loading from cache (< 7 days old)."` — cache hit, no fetch needed
+- `"No mapping data found for cDNA coordinate X"` — Ensembl coordinate couldn't be mapped (expected for some variants)
+- `"Error fetching genome position for coordinate Y"` — Ensembl API error (will skip)
+
+ClinVar warnings to watch for:
+- `"ClinVar: NCBI fetch failed. Falling back to stale cache."` — network issue; app continues with old data
+- `"ClinVar: NCBI fetch failed and no cache found."` — ClinVar track will be empty this session
 
 These messages are informational and don't indicate problems unless all variants fail.
 
@@ -500,6 +608,13 @@ https://gladkia.github.io/igvShiny/, https://github.com/gladkia/igvShiny
 ```
 Yates AD, et al. (2020). Ensembl 2020. Nucleic Acids Research, 
 48(D1), D682-D688. doi: 10.1093/nar/gkz966
+```
+
+**NCBI E-utilities (ClinVar data):**
+```
+Sayers EW, et al. (2022). Database resources of the National Center for 
+Biotechnology Information. Nucleic Acids Research, 50(D1), D20-D26. 
+doi: 10.1093/nar/gkab1112
 ```
 
 ### BibTeX Entries
@@ -540,6 +655,7 @@ Yates AD, et al. (2020). Ensembl 2020. Nucleic Acids Research,
 
 - **igvShiny developers**: Paul Shannon, Arkadiusz Gladki, Karolina Scigocka
 - **Ensembl**: Genome annotation and REST API services
+- **NCBI**: ClinVar database and E-utilities API
 - **R Shiny team**: Application framework
 - **SYNGAP1 research community**: Collaborative data sharing and research efforts
 
@@ -584,12 +700,19 @@ Data is publicly available through Citizen Health and Cure SYNGAP1.
 
 ## Version History
 
+### v2.1.0 (2026)
+- Added live ClinVar integration via NCBI E-utilities (esearch + esummary)
+- ClinVar data fetched automatically on startup and cached locally for 7 days
+- ClinVar variants displayed as a toggleable teal reference track in IGV
+- All ClinVar metadata (germline classification, review status, conditions, etc.) accessible on variant click
+- Log-spaced size filter slider (1–50,000 KB, default 100 KB) controls which ClinVar variants are shown by genomic span; reloads track live on change
+
 ### v1.0.0 (2025)
 - Initial release
 - Support for 153 variants
 - Three filter types (biorepository, iPSC, mouse models)
 - IGV browser integration
-- Ensembl API with caching
+- Ensembl API with permanent caching
 - Color-coded variant types
 - Reactive filtering
 
@@ -599,7 +722,7 @@ Data is publicly available through Citizen Health and Cure SYNGAP1.
 
 ---
 
-**Last Updated:** 02-03-2026  
+**Last Updated:** 02-17-2026  
 **Repository:** cmcneil-02  
-**Documentation Version:** 1.0  
+**Documentation Version:** 2.1  
 **Maintained by:** CURE SYNGAP1 Team

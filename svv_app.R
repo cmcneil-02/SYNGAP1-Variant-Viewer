@@ -6,19 +6,38 @@
 #           variants with patient data and research asset tracking             #
 #                                                                              #
 #  Architecture:                                                               #
-#    1. Data Loading & Preprocessing (lines 1-172)                             #
+#    1. Package Dependencies (~line 33)                                        #
+#                                                                              #
+#    1B. ClinVar Data Loading (~line 72)                                       #
+#       - Fetch SYNGAP1 variants from NCBI ClinVar via E-utilities API         #
+#       - Cache results locally with 7-day expiry                              #
+#                                                                              #
+#    2-6. Data Structures, Helpers & API Integration (~lines 441-828)          #
+#       - Amino acid code lookup table                                         #
+#       - Protein nomenclature formatting functions                            #
+#       - cDNA coordinate extraction                                           #
+#       - Ensembl REST API queries with permanent disk cache                   #
+#                                                                              #
+#    7. Data Loading & Preprocessing (~line 830)                               #
 #       - Load patient variant data from CSV                                   #
 #       - Convert cDNA coordinates to genome positions via Ensembl API         #
-#       - Cache results for fast subsequent loads                              #
+#       - Merge positions into variant data frame                              #
 #                                                                              #
-#    2. UI Definition (lines 187-229)                                          #
+#    8. UI Definition (~line 1046)                                             #
 #       - Sidebar with dynamic variant type buttons                            #
+#       - Static ClinVar track button + log-spaced size filter slider (1–50,000 KB) #
 #       - Checkboxes for filtering by research assets                          #
 #       - Main panel with IGV genome browser                                   #
 #                                                                              #
-#    3. Server Logic (lines 266-398)                                           #
+#    9-9B. GFF3 Track Formatting (~lines 1195-1428)                            #
+#       - Format internal variant data as GFF3 for IGV                        #
+#       - Format ClinVar data as GFF3 for IGV                                 #
+#                                                                              #
+#    10. Server Logic (~line 1430)                                             #
 #       - Reactive filtering based on user selections                          #
-#       - Dynamic track loading/updating                                       #
+#       - Dynamic track loading/updating for internal variants                 #
+#       - ClinVar track loading on button click                                #
+#       - ClinVar track reloading on size slider change                        #
 #       - IGV browser rendering and interaction                                #
 #                                                                              #
 #  Design Philosophy:                                                          #
@@ -60,6 +79,12 @@ library(jsonlite)
 # Why: Cache expensive API calls to disk for instant retrieval on subsequent runs
 library(memoise)
 
+# Extended Shiny widgets
+# Why: sliderTextInput() provides a logarithmic-style slider by accepting an
+#      explicit vector of stop values, giving fine-grained control at the low
+#      end of the ClinVar size filter without sacrificing upper-range coverage
+library(shinyWidgets)
+
 ################################################################################
 # CITATION
 ################################################################################
@@ -67,6 +92,376 @@ library(memoise)
 # Integrative Genomics Viewer (IGV - an interactive tool for visualization 
 # and exploration integrated genomic data). R package version 1.2.0, 
 # https://gladkia.github.io/igvShiny/, https://github.com/gladkia/igvShiny.
+
+################################################################################
+# SECTION 1B: CLINVAR DATA LOADING — LIVE NCBI E-UTILITIES FETCH WITH CACHE
+################################################################################
+
+# ClinVar data is fetched live from NCBI and cached locally for 7 days.
+#
+# Why live fetch instead of a static file?
+#   - ClinVar is updated continuously; new SYNGAP1 submissions appear regularly.
+#   - A static file requires manual re-download and redeployment to stay current.
+#   - The E-utilities API is free, does not require an account, and is stable.
+#
+# Cache strategy (time-based, not permanent):
+#   Unlike the Ensembl coordinate cache (which is permanent because hg38
+#   positions never change), ClinVar classifications and submissions DO change.
+#   We use a 7-day expiry: on first run or after 7 days, the app re-fetches;
+#   otherwise it loads the cached .rds file instantly.
+#
+#   Cache files:
+#     cache/clinvar/clinvar_data.rds   — parsed data frame
+#     cache/clinvar/last_updated.txt   — ISO timestamp of last successful fetch
+#
+# NCBI E-utilities used (no API key required; rate limit = 3 req/sec):
+#   1. esearch  — retrieve all ClinVar variation IDs for SYNGAP1[gene]
+#   2. esummary — retrieve full variant metadata for each ID (batched, 200/call)
+#
+# Note on API key:
+#   If your organization obtains an NCBI API key in the future, add it as:
+#     api_key = "YOUR_KEY_HERE"
+#   to the GET() calls below, which raises the rate limit to 10 req/sec.
+
+# Ensure cache directory exists
+dir.create("cache/clinvar", recursive = TRUE, showWarnings = FALSE)
+
+CLINVAR_CACHE_RDS       <- "cache/clinvar/clinvar_data.rds"
+CLINVAR_CACHE_TIMESTAMP <- "cache/clinvar/last_updated.txt"
+CLINVAR_CACHE_DAYS      <- 7          # Re-fetch after this many days
+CLINVAR_BATCH_SIZE      <- 200        # IDs per esummary call (NCBI recommended max)
+CLINVAR_RATE_DELAY      <- 0.4        # Seconds between requests (stays under 3/sec)
+NCBI_BASE               <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+#' Check Whether the ClinVar Cache is Still Fresh
+#'
+#' @description
+#' Returns TRUE if a valid cache file exists and was written within
+#' CLINVAR_CACHE_DAYS days. Returns FALSE if the cache is absent,
+#' unreadable, or expired — triggering a fresh API fetch.
+clinvar_cache_is_fresh <- function() {
+  if (!file.exists(CLINVAR_CACHE_RDS) ||
+      !file.exists(CLINVAR_CACHE_TIMESTAMP)) return(FALSE)
+  
+  timestamp_str <- tryCatch(
+    readLines(CLINVAR_CACHE_TIMESTAMP, n = 1, warn = FALSE),
+    error = function(e) return("")
+  )
+  if (nchar(trimws(timestamp_str)) == 0) return(FALSE)
+  
+  last_updated <- tryCatch(
+    as.POSIXct(timestamp_str, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC"),
+    error = function(e) return(NA)
+  )
+  if (is.na(last_updated)) return(FALSE)
+  
+  age_days <- as.numeric(difftime(Sys.time(), last_updated, units = "days"))
+  return(age_days < CLINVAR_CACHE_DAYS)
+}
+
+#' Fetch All SYNGAP1 ClinVar Variation IDs via esearch
+#'
+#' @description
+#' Queries NCBI esearch for all ClinVar entries associated with SYNGAP1.
+#' Returns a character vector of variation IDs (e.g. c("12345", "67890", ...)).
+#' Returns NULL on network failure so the caller can fall back to cache.
+fetch_clinvar_ids <- function() {
+  message("ClinVar: querying NCBI esearch for SYNGAP1 variation IDs...")
+  
+  url <- paste0(
+    NCBI_BASE, "esearch.fcgi",
+    "?db=clinvar",
+    "&term=SYNGAP1%5Bgene%5D",   # SYNGAP1[gene] — URL-encoded
+    "&retmax=10000",              # Upper bound; SYNGAP1 currently has ~1900
+    "&retmode=json"
+  )
+  
+  resp <- tryCatch(
+    GET(url, httr::timeout(30)),   # Qualified to avoid namespace collision with other packages
+    error = function(e) {
+      warning("ClinVar esearch network error: ", conditionMessage(e))
+      NULL
+    }
+  )
+  
+  if (is.null(resp)) return(NULL)
+  
+  if (http_error(resp)) {
+    warning("ClinVar esearch HTTP error: status ", status_code(resp),
+            " — ", content(resp, "text", encoding = "UTF-8"))
+    return(NULL)
+  }
+  
+  parsed <- tryCatch(
+    fromJSON(content(resp, "text", encoding = "UTF-8")),
+    error = function(e) {
+      warning("ClinVar esearch JSON parse error: ", conditionMessage(e))
+      NULL
+    }
+  )
+  if (is.null(parsed)) return(NULL)
+  
+  ids <- parsed$esearchresult$idlist
+  message("ClinVar: found ", length(ids), " variation IDs.")
+  return(ids)
+}
+
+#' Parse a Single esummary Record into a One-Row Data Frame
+#'
+#' @description
+#' Extracts the fields we need from one ClinVar esummary JSON result object.
+#' Any field that is absent or malformed in the JSON is set to NA gracefully.
+#'
+#' Field mapping verified against live NCBI esummary API response (2026-02):
+#'   - Assembly field is "assembly_name" (not "Assembly")
+#'   - Somatic field is "clinical_impact_classification" (not "somatic_clinical_impact")
+#'   - molecular_consequence_list entries are plain strings (not named sub-objects)
+#'   - trait_set lives inside germline_classification (not at record top level)
+#'   - Canonical SPDI is at variation_set[[1]]$canonical_spdi
+#'   - Variant name is at variation_set[[1]]$variation_name (also in top-level title)
+#'   - Gene symbol is at genes[[1]]$symbol
+#'
+#' @param rec One list element from the esummary "result" object
+#' @return Single-row data frame with all ClinVar metadata columns
+parse_esummary_record <- function(rec) {
+  
+  # Helper: safely extract a scalar value, return NA if absent/empty
+  safe <- function(x, default = NA_character_) {
+    if (is.null(x) || length(x) == 0) return(default)
+    v <- trimws(as.character(x[[1]]))
+    if (length(v) == 0 || is.na(v) || v == "") return(default)
+    v
+  }
+  
+  # --- Variant name, gene, basic fields ---
+  vset         <- rec$variation_set[[1]]
+  name         <- safe(vset$variation_name)
+  gene         <- safe(rec$genes[[1]]$symbol)
+  protein_chg  <- safe(rec$protein_change)
+  accession    <- safe(rec$accession)
+  variation_id <- safe(rec$uid)
+  variant_type <- safe(rec$obj_type)
+  canonical_spdi <- safe(vset$canonical_spdi)
+  
+  # molecular_consequence_list entries are plain character strings
+  mol_conseq <- if (!is.null(rec$molecular_consequence_list) &&
+                    length(rec$molecular_consequence_list) > 0) {
+    safe(rec$molecular_consequence_list[[1]])
+  } else { NA_character_ }
+  
+  # allele_id and dbsnp_id are not present in esummary — set to NA
+  # (available in efetch full XML if needed in future)
+  allele_id <- NA_character_
+  dbsnp_id  <- NA_character_
+  
+  # --- Condition: trait_set lives inside germline_classification ---
+  germ      <- rec$germline_classification
+  germ_sig  <- safe(germ$description)
+  germ_date <- safe(germ$last_evaluated)
+  germ_rev  <- safe(germ$review_status)
+  
+  condition <- if (!is.null(germ$trait_set) && length(germ$trait_set) > 0) {
+    trait_names <- sapply(germ$trait_set, function(t) {
+      # trait_name can be either a direct string or a list with a name field
+      if (is.character(t)) safe(t)
+      else safe(t$trait_name)
+    })
+    trait_names <- trait_names[!is.na(trait_names)]
+    if (length(trait_names) > 0) paste(trait_names, collapse = "; ") else NA_character_
+  } else { NA_character_ }
+  
+  # --- Somatic clinical impact (field is "clinical_impact_classification") ---
+  som       <- rec$clinical_impact_classification
+  som_sig   <- safe(som$description)
+  som_date  <- safe(som$last_evaluated)
+  som_rev   <- safe(som$review_status)
+  
+  # --- Oncogenicity ---
+  onco      <- rec$oncogenicity_classification
+  onco_sig  <- safe(onco$description)
+  onco_date <- safe(onco$last_evaluated)
+  onco_rev  <- safe(onco$review_status)
+  
+  # --- GRCh38 genomic coordinates ---
+  # variation_loc is a list of location objects, one per assembly.
+  # Match on assembly_name == "GRCh38" (field verified from live response).
+  chr38   <- NA_character_
+  start38 <- NA_real_
+  end38   <- NA_real_
+  
+  locs <- vset$variation_loc
+  if (!is.null(locs) && length(locs) > 0) {
+    for (loc in locs) {
+      if (!is.null(loc$assembly_name) && loc$assembly_name == "GRCh38") {
+        chr38   <- safe(loc$chr)
+        start38 <- suppressWarnings(as.numeric(safe(loc$start)))
+        end38   <- suppressWarnings(as.numeric(safe(loc$stop)))
+        # SNVs have start == stop; give 1 bp width so IGV renders them visibly
+        if (!is.na(start38) && !is.na(end38) && start38 == end38) {
+          end38 <- end38 + 1L
+        }
+        break
+      }
+    }
+  }
+  
+  # Return one-row data frame with column names matching create_clinvar_gff3_data()
+  data.frame(
+    Name                                          = name,
+    Gene.s.                                       = gene,
+    Protein.change                                = protein_chg,
+    Condition.s.                                  = condition,
+    Accession                                     = accession,
+    VariationID                                   = variation_id,
+    AlleleID.s.                                   = allele_id,
+    dbSNP.ID                                      = dbsnp_id,
+    Canonical.SPDI                                = canonical_spdi,
+    Variant.type                                  = variant_type,
+    Molecular.consequence                         = mol_conseq,
+    Germline.classification                       = germ_sig,
+    Germline.date.last.evaluated                  = germ_date,
+    Germline.review.status                        = germ_rev,
+    Somatic.clinical.impact                       = som_sig,
+    Somatic.clinical.impact.date.last.evaluated   = som_date,
+    Somatic.clinical.impact.review.status         = som_rev,
+    Oncogenicity.classification                   = onco_sig,
+    Oncogenicity.date.last.evaluated              = onco_date,
+    Oncogenicity.review.status                    = onco_rev,
+    clinvar_chr                                   = if (!is.na(chr38)) paste0("chr", chr38) else NA_character_,
+    clinvar_start                                 = start38,
+    clinvar_end                                   = end38,
+    stringsAsFactors = FALSE
+  )
+}
+
+#' Fetch Full ClinVar Metadata for a Vector of Variation IDs via esummary
+#'
+#' @description
+#' Calls NCBI esummary in batches of CLINVAR_BATCH_SIZE IDs, parses each
+#' result record, and returns a single combined data frame.
+#'
+#' @param ids Character vector of ClinVar variation IDs from fetch_clinvar_ids()
+#' @return Data frame of all variants, or NULL on complete failure
+fetch_clinvar_summaries <- function(ids) {
+  batches    <- split(ids, ceiling(seq_along(ids) / CLINVAR_BATCH_SIZE))
+  n_batches  <- length(batches)
+  all_rows   <- vector("list", n_batches)
+  
+  message("ClinVar: fetching summaries in ", n_batches,
+          " batches of up to ", CLINVAR_BATCH_SIZE, " IDs each...")
+  
+  for (i in seq_along(batches)) {
+    message("  Batch ", i, " / ", n_batches, "...")
+    
+    id_string <- paste(batches[[i]], collapse = ",")
+    url <- paste0(
+      NCBI_BASE, "esummary.fcgi",
+      "?db=clinvar",
+      "&id=", id_string,
+      "&retmode=json"
+    )
+    
+    resp <- tryCatch(GET(url), error = function(e) NULL)
+    if (is.null(resp) || http_error(resp)) {
+      warning("  esummary batch ", i, " failed — skipping.")
+      Sys.sleep(CLINVAR_RATE_DELAY)
+      next
+    }
+    
+    parsed <- tryCatch(
+      fromJSON(content(resp, "text", encoding = "UTF-8"), simplifyVector = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(parsed) || is.null(parsed$result)) {
+      warning("  esummary batch ", i, " returned unparseable JSON — skipping.")
+      Sys.sleep(CLINVAR_RATE_DELAY)
+      next
+    }
+    
+    # parsed$result is a named list; "uids" is the list of IDs, the rest are records
+    uids    <- parsed$result$uids
+    records <- parsed$result[names(parsed$result) != "uids"]
+    
+    batch_rows <- lapply(records, function(rec) {
+      tryCatch(parse_esummary_record(rec), error = function(e) NULL)
+    })
+    batch_rows <- Filter(Negate(is.null), batch_rows)
+    
+    if (length(batch_rows) > 0) {
+      all_rows[[i]] <- do.call(rbind, batch_rows)
+    }
+    
+    Sys.sleep(CLINVAR_RATE_DELAY)   # Respect NCBI rate limit (3 req/sec)
+  }
+  
+  combined <- do.call(rbind, Filter(Negate(is.null), all_rows))
+  if (is.null(combined) || nrow(combined) == 0) return(NULL)
+  
+  message("ClinVar: successfully parsed ", nrow(combined), " variant records.")
+  return(combined)
+}
+
+#' Load ClinVar Data — from Cache if Fresh, Otherwise Fetch from NCBI
+#'
+#' @description
+#' Top-level entry point called once at app startup.
+#'
+#' Decision logic:
+#'   1. If cache exists and is < 7 days old → load .rds (instant, no network)
+#'   2. Otherwise → fetch from NCBI E-utilities, save to cache
+#'   3. If fetch fails AND stale cache exists → use stale cache with a warning
+#'   4. If fetch fails AND no cache → return empty data frame (app still loads)
+#'
+#' The 7-day window balances freshness against startup time.
+#' ClinVar is updated monthly for most genes; 7-day polling is more than adequate.
+#'
+#' @return Data frame ready for use by create_clinvar_gff3_data()
+load_clinvar_data <- function() {
+  
+  # ── Path 1: Fresh cache ──────────────────────────────────────────────────
+  if (clinvar_cache_is_fresh()) {
+    message("ClinVar: loading from cache (< ", CLINVAR_CACHE_DAYS, " days old).")
+    return(readRDS(CLINVAR_CACHE_RDS))
+  }
+  
+  # ── Path 2: Fetch from NCBI ──────────────────────────────────────────────
+  message("ClinVar: cache absent or expired — fetching from NCBI E-utilities...")
+  
+  ids  <- fetch_clinvar_ids()
+  data <- if (!is.null(ids) && length(ids) > 0) fetch_clinvar_summaries(ids) else NULL
+  
+  if (!is.null(data) && nrow(data) > 0) {
+    # Save fresh data and update timestamp
+    saveRDS(data, CLINVAR_CACHE_RDS)
+    writeLines(
+      format(Sys.time(), format = "%Y-%m-%dT%H:%M:%S", tz = "UTC"),
+      CLINVAR_CACHE_TIMESTAMP
+    )
+    message("ClinVar: cache updated successfully.")
+    return(data)
+  }
+  
+  # ── Path 3: Fetch failed — fall back to stale cache if available ─────────
+  if (file.exists(CLINVAR_CACHE_RDS)) {
+    warning(
+      "ClinVar: NCBI fetch failed. Falling back to stale cache. ",
+      "Data may be outdated."
+    )
+    return(readRDS(CLINVAR_CACHE_RDS))
+  }
+  
+  # ── Path 4: No data at all ───────────────────────────────────────────────
+  warning(
+    "ClinVar: NCBI fetch failed and no cache found. ",
+    "ClinVar track will be empty."
+  )
+  return(data.frame())
+}
+
+# Load (or fetch) ClinVar data at startup.
+# On first run this takes ~30-60 seconds depending on network speed.
+# On subsequent runs within 7 days it loads from cache in < 1 second.
+clinvar_data <- load_clinvar_data()
 
 ################################################################################
 # SECTION 2: DATA STRUCTURES & CONSTANTS
@@ -669,7 +1064,8 @@ color_table <- list(
   gain      = "#CBE7D4",      # Light Green
   vus       = "#D4CAE1",      # Lavender
   intronic  = "#4E4E4E",      # Gray
-  loss      = "#4E4E4E"       # Gray
+  loss      = "#4E4E4E",      # Gray
+  clinvar   = "#00BCD4"       # Teal - visually distinct from all internal track colors
 )
 
 ################################################################################
@@ -713,6 +1109,60 @@ ui <- shinyUI(fluidPage(
       #   - Automatically adapts to data
       # Rendered by server (see output$trackButtons below)
       uiOutput("trackButtons"),
+      
+      # ----------------------------------------
+      # ClinVar Track Button (static)
+      # ----------------------------------------
+      # This button is static (not part of the dynamic variant-type loop)
+      # because ClinVar is an external reference dataset, not a filtered
+      # subset of the internal Citizen Health variant data.
+      # It always appears regardless of which filters are active.
+      hr(style = "border-top: 1px solid #ccc; margin: 8px 0;"),
+      actionButton(
+        inputId = "addTrack_clinvar",
+        label   = "ClinVar"
+      ),
+      
+      # ClinVar size filter slider
+      # Filters ClinVar variants shown on the track by their genomic span.
+      #
+      # Why sliderTextInput() instead of sliderInput()?
+      #   ClinVar spans an enormous size range: ~1 bp SNVs up to ~46,632 KB
+      #   whole-chromosome CNVs. A linear slider across that range would make
+      #   the low end (where most interesting variants live) nearly impossible
+      #   to control. sliderTextInput() accepts an explicit vector of stop
+      #   values, so we can space them logarithmically: fine steps at the bottom
+      #   (1, 2, 3 … 10 KB) and progressively coarser steps toward the top
+      #   (5,000 KB steps above 10,000 KB). Every stop is a "round" KB value
+      #   that makes clinical sense.
+      #
+      # Stop sequence (45 positions total):
+      #   1–9 KB      : step 1 KB   (fine control for point variants / small indels)
+      #   10–90 KB    : step 10 KB  (single-exon to multi-exon deletions)
+      #   100–900 KB  : step 100 KB (sub-megabase SVs)
+      #   1,000–9,000 KB : step 1,000 KB (megabase-scale CNVs)
+      #   10,000–50,000 KB : step 5,000 KB (cytogenetic-band CNVs)
+      #
+      # Default: 100 KB — excludes whole-gene CNVs while retaining variants
+      #   within the SYNGAP1 locus (~37 kb). Users drag right to reveal
+      #   progressively larger structural variants.
+      #
+      # Behavior: If the ClinVar track is already displayed, moving the slider
+      # immediately reloads it with only variants at or below the new threshold.
+      sliderTextInput(
+        inputId  = "clinvar_size_kb",
+        label    = "Max ClinVar variant size (KB)",
+        choices  = c(
+          seq(1,     9,     by = 1),      #  1–9 KB    : step 1 KB
+          seq(10,    90,    by = 10),     # 10–90 KB   : step 10 KB
+          seq(100,   900,   by = 100),    # 100–900 KB : step 100 KB
+          seq(1000,  9000,  by = 1000),   # 1–9 MB     : step 1,000 KB
+          seq(10000, 50000, by = 5000)    # 10–50 MB   : step 5,000 KB
+        ),
+        selected = 100,
+        grid     = FALSE,
+        width    = "100%"
+      ),
       
       # Spacer for visual separation
       # Improves readability by grouping buttons vs checkboxes
@@ -915,6 +1365,142 @@ create_gff3_data <- function(data, variant_type) {
 }
 
 ################################################################################
+# SECTION 9B: CLINVAR DATA FORMATTING FOR IGV
+################################################################################
+
+#' Create GFF3-formatted Data from ClinVar API Data for IGV Tracks
+#'
+#' @description
+#' Converts the parsed ClinVar data frame into GFF3 format required by IGV.
+#' All available ClinVar metadata fields are packed into the GFF3 attributes
+#' column so they appear in IGV's feature detail pop-up when a user clicks
+#' a variant.
+#'
+#' @param data The clinvar_data data frame (fetched at startup via NCBI E-utilities)
+#' @param max_size_kb Numeric. Maximum variant span in kilobases to include in
+#'   the track. Variants whose (end - start) exceeds this threshold are excluded.
+#'   Defaults to 100 KB. Driven by the "Max ClinVar variant size" slider in the
+#'   UI; pass as.numeric(input$clinvar_size_kb) from the server.
+#'
+#' @return Data frame in GFF3 format for use with loadGFF3TrackFromLocalData()
+#'
+#' @details
+#' GFF3 columns produced:
+#'   seqid      - "chr6" (all SYNGAP1 variants are on chromosome 6)
+#'   source     - "ClinVar"
+#'   type       - "clinvar" (drives teal color via color_table)
+#'   start      - GRCh38 start position (parsed from GRCh38Location)
+#'   end        - GRCh38 end position
+#'   score      - "."
+#'   strand     - "+"
+#'   phase      - "."
+#'   attributes - All ClinVar metadata fields as key=value pairs
+#'
+#' Attributes included (all available ClinVar fields):
+#'   Name, ProteinChange, Condition, Accession, VariationID, AlleleID,
+#'   dbSNP_ID, CanonicalSPDI, VariantType, MolecularConsequence,
+#'   GermlineClassification, GermlineLastEvaluated, GermlineReviewStatus,
+#'   SomaticClinicalImpact, SomaticLastEvaluated, SomaticReviewStatus,
+#'   OncogenicityClassification, OncogenicityLastEvaluated,
+#'   OncogenicityReviewStatus
+#'
+#' Design Decision: Why include all fields?
+#'   - ClinVar metadata is rich and clinically meaningful
+#'   - Users can click a variant to see full clinical context
+#'   - Avoids information loss from the source dataset
+#'   - Mirrors IGV's standard ClinVar track behavior
+
+create_clinvar_gff3_data <- function(data, max_size_kb = 100) {
+  
+  # Guard: return empty GFF3 frame if ClinVar data failed to load.
+  # This happens when both the NCBI fetch and the cache are unavailable,
+  # leaving clinvar_data as a zero-column data.frame().
+  # Without this guard, dplyr::filter() crashes trying to reference
+  # clinvar_start on a frame that has no columns at all.
+  required_cols <- c("clinvar_start", "clinvar_end", "clinvar_chr")
+  if (nrow(data) == 0 || !all(required_cols %in% names(data))) {
+    message("ClinVar: no data available — track will be empty.")
+    return(data.frame())
+  }
+  
+  # Helper: sanitize a value for GFF3 attribute string
+  # Replaces semicolons and equals signs which are GFF3 delimiters,
+  # and trims whitespace. Returns "." for NA/empty values.
+  clean_attr <- function(x) {
+    x <- as.character(x)
+    x <- trimws(x)
+    x[is.na(x) | x == ""] <- "."
+    # Escape GFF3 reserved characters inside values
+    x <- gsub(";", "%3B", x, fixed = TRUE)
+    x <- gsub("=", "%3D", x, fixed = TRUE)
+    x
+  }
+  
+  # Convert KB threshold to base pairs for coordinate arithmetic
+  max_size_bp <- max_size_kb * 1000
+  
+  data %>%
+    # Remove variants without valid GRCh38 coordinates
+    # These are typically older submissions that predate hg38 mapping
+    filter(!is.na(clinvar_start) & !is.na(clinvar_end)) %>%
+    
+    # Remove variants whose span exceeds the user-specified size threshold.
+    #
+    # Why: Large copy number variants (e.g. chr6:156,974-46,789,291) span
+    # millions of base pairs and physically cover the entire SYNGAP1 locus.
+    # At every zoom level they sit on top of all smaller point variants,
+    # intercepting every click and making the underlying variants unreachable.
+    #
+    # The threshold is controlled by the "Max variant size" slider in the UI
+    # (default 100 kb). Lowering it progressively hides larger SVs and CNVs,
+    # letting the user focus on point variants and small indels.
+    #   - SYNGAP1 itself is ~37 kb, so 100 kb already excludes whole-gene CNVs.
+    #   - Large CNVs spanning cytogenetic bands are not interpretable at this
+    #     zoom level and are better reviewed directly in ClinVar's own browser.
+    filter((clinvar_end - clinvar_start) <= max_size_bp) %>%
+    
+    mutate(
+      # --- Required GFF3 columns ---
+      seqid  = clinvar_chr,          # Chromosome (e.g. "chr6")
+      source = "ClinVar",            # Data provenance label
+      type   = "clinvar",            # Drives teal color via color_table
+      start  = clinvar_start,
+      end    = clinvar_end,
+      score  = ".",
+      strand = "+",                  # SYNGAP1 is on forward strand
+      phase  = ".",
+      
+      # --- Attributes column: all ClinVar metadata ---
+      # IGV displays these as a table when the user clicks a feature.
+      # Fields are semicolon-separated key=value pairs per GFF3 spec.
+      attributes = paste0(
+        "ID=",                              clean_attr(Accession),
+        ";Name=",                           clean_attr(Name),
+        ";ProteinChange=",                  clean_attr(Protein.change),
+        ";Condition=",                      clean_attr(Condition.s.),
+        ";Accession=",                      clean_attr(Accession),
+        ";VariationID=",                    clean_attr(VariationID),
+        ";AlleleID=",                       clean_attr(AlleleID.s.),
+        ";dbSNP_ID=",                       clean_attr(dbSNP.ID),
+        ";CanonicalSPDI=",                  clean_attr(Canonical.SPDI),
+        ";VariantType=",                    clean_attr(Variant.type),
+        ";MolecularConsequence=",           clean_attr(Molecular.consequence),
+        ";GermlineClassification=",         clean_attr(Germline.classification),
+        ";GermlineLastEvaluated=",          clean_attr(Germline.date.last.evaluated),
+        ";GermlineReviewStatus=",           clean_attr(Germline.review.status),
+        ";SomaticClinicalImpact=",          clean_attr(Somatic.clinical.impact),
+        ";SomaticLastEvaluated=",           clean_attr(Somatic.clinical.impact.date.last.evaluated),
+        ";SomaticReviewStatus=",            clean_attr(Somatic.clinical.impact.review.status),
+        ";OncogenicityClassification=",     clean_attr(Oncogenicity.classification),
+        ";OncogenicityLastEvaluated=",      clean_attr(Oncogenicity.date.last.evaluated),
+        ";OncogenicityReviewStatus=",       clean_attr(Oncogenicity.review.status)
+      )
+    ) %>%
+    # Select GFF3 columns in the required order
+    select(seqid, source, type, start, end, score, strand, phase, attributes)
+}
+
+################################################################################
 # SECTION 10: SERVER LOGIC (REACTIVE PROGRAMMING)
 ################################################################################
 
@@ -960,6 +1546,15 @@ server <- function(input, output, session) {
   # reactiveVal() creates a reactive variable that can be read and set
   # Like a reactive version of a regular variable
   added_tracks <- reactiveVal(list())
+  
+  # ClinVar Track State Tracker
+  #
+  # Separate from added_tracks because ClinVar is not part of the dynamic
+  # variant-type loop. This flag lets the slider observer know whether to
+  # reload the ClinVar track when the size threshold changes.
+  #   TRUE  = ClinVar track is currently displayed in IGV
+  #   FALSE = ClinVar track has not been added yet (slider changes are no-ops)
+  clinvar_track_added <- reactiveVal(FALSE)
   
   # ============================================================
   # DATA FILTERING (REACTIVE EXPRESSION)
@@ -1174,6 +1769,128 @@ server <- function(input, output, session) {
   })
   
   # ============================================================
+  # CLINVAR TRACK BUTTON HANDLER
+  # ============================================================
+  
+  #' Handle ClinVar Track Button Click
+  #'
+  # @description
+  # Loads the ClinVar variant track into IGV when the user clicks "ClinVar".
+  #
+  # Design Notes:
+  #   - Handled separately from the dynamic variant-type loop because ClinVar
+  #     is an external reference dataset, not a filtered subset of internal data.
+  #   - Not affected by the biorepository / cell-line / mouse-line checkboxes.
+  #   - Uses pre-parsed clinvar_data (built at startup) for instant response.
+  #   - Passes the current slider value to create_clinvar_gff3_data() so the
+  #     initial load already respects whatever size threshold is set.
+  #   - Sets clinvar_track_added(TRUE) so the slider observer knows to react
+  #     to future threshold changes.
+  #   - Track name "ClinVar" is used so it appears as a labeled track in IGV.
+  
+  observeEvent(input$addTrack_clinvar, {
+    
+    # Mark ClinVar track as active so the slider observer can reload it
+    clinvar_track_added(TRUE)
+    
+    # Build GFF3 from parsed ClinVar data, applying the current size threshold.
+    # as.numeric() is required because sliderTextInput() returns a character.
+    clinvar_gff3 <- create_clinvar_gff3_data(clinvar_data,
+                                             max_size_kb = as.numeric(input$clinvar_size_kb))
+    
+    if (nrow(clinvar_gff3) > 0) {
+      # Load ClinVar track into IGV
+      # trackName = "ClinVar" sets the label visible in the IGV track panel
+      loadGFF3TrackFromLocalData(
+        session,
+        id                = "igvShiny_0",
+        trackName         = "ClinVar",
+        tbl               = clinvar_gff3,
+        colorTable        = color_table,
+        colorByAttribute  = "type",       # "clinvar" type → teal (#00BCD4)
+        trackHeight       = 50,           # Slightly taller than internal tracks
+        displayMode       = "EXPANDED",   # Show all variants (not collapsed)
+        visibilityWindow  = 1e8           # Visible at all zoom levels
+      )
+    } else {
+      # Fallback: load empty track if all rows lacked GRCh38 coordinates
+      # Unlikely with a fresh ClinVar download, but handles gracefully
+      loadGFF3TrackFromLocalData(
+        session,
+        id                = "igvShiny_0",
+        trackName         = "ClinVar",
+        tbl               = data.frame(),
+        colorTable        = color_table,
+        colorByAttribute  = "type",
+        trackHeight       = 50,
+        displayMode       = "EXPANDED",
+        visibilityWindow  = 1e8
+      )
+    }
+    
+    # Re-center view on SYNGAP1 after adding track
+    showGenomicRegion(session, id = "igvShiny_0", region = "SYNGAP1")
+    
+  }, ignoreInit = TRUE)
+  
+  # ============================================================
+  # CLINVAR SIZE SLIDER HANDLER
+  # ============================================================
+  
+  #' Reload ClinVar Track When Size Threshold Changes
+  #'
+  # @description
+  # Responds to changes in the "Max ClinVar variant size" slider by reloading
+  # the ClinVar track with only variants at or below the new KB threshold.
+  #
+  # Only fires if ClinVar track has already been added (clinvar_track_added()
+  # is TRUE) — avoids a no-op reload on app startup when the slider is
+  # initialized but no track exists yet.
+  #
+  # Design: Same reload pattern as the filter-change handler used for internal
+  # variant tracks — replace the existing track with a freshly filtered one.
+  # IGV handles the swap without flicker.
+  
+  observeEvent(input$clinvar_size_kb, {
+    
+    # Only reload if the ClinVar track is actually displayed
+    if (!clinvar_track_added()) return()
+    
+    # Re-build GFF3 with the updated size threshold.
+    # as.numeric() is required because sliderTextInput() returns a character.
+    clinvar_gff3 <- create_clinvar_gff3_data(clinvar_data,
+                                             max_size_kb = as.numeric(input$clinvar_size_kb))
+    
+    if (nrow(clinvar_gff3) > 0) {
+      loadGFF3TrackFromLocalData(
+        session,
+        id                = "igvShiny_0",
+        trackName         = "ClinVar",
+        tbl               = clinvar_gff3,
+        colorTable        = color_table,
+        colorByAttribute  = "type",
+        trackHeight       = 50,
+        displayMode       = "EXPANDED",
+        visibilityWindow  = 1e8
+      )
+    } else {
+      # All ClinVar variants exceed the threshold — show empty track
+      loadGFF3TrackFromLocalData(
+        session,
+        id                = "igvShiny_0",
+        trackName         = "ClinVar",
+        tbl               = data.frame(),
+        colorTable        = color_table,
+        colorByAttribute  = "type",
+        trackHeight       = 50,
+        displayMode       = "EXPANDED",
+        visibilityWindow  = 1e8
+      )
+    }
+    
+  }, ignoreInit = TRUE)  # Don't fire on startup before a track exists
+  
+  # ============================================================
   # FILTER CHANGE HANDLING
   # ============================================================
   
@@ -1324,16 +2041,18 @@ shinyApp(ui = ui, server = server)
 # 2. USER INTERACTIONS
 #    Click Button → Filter Data → Format GFF3 → Load Track → Update IGV
 #    Check Filter → Filter Data → Reload Tracks → Update IGV
+#    Move Size Slider → Re-filter ClinVar by span → Reload ClinVar Track → Update IGV
 #
 # 3. PERFORMANCE OPTIMIZATIONS
-#    - Memoization: API calls cached to disk (150x speedup)
+#    - Memoization: Ensembl coordinate lookups cached permanently to disk (150x speedup)
+#    - Time-limited cache: ClinVar data re-fetched from NCBI every 7 days
 #    - Preprocessing: Parse data once at startup, not per interaction
 #    - Reactive expressions: Auto-recompute only when inputs change
 #    - Batch operations: Prefetch all coordinates before UI loads
 #
 # 4. KEY DESIGN DECISIONS
 #    - Separate data processing from UI rendering
-#    - Cache external API calls permanently
+#    - Cache Ensembl coordinate lookups permanently; ClinVar data with 7-day expiry
 #    - Use reactive programming for smooth interactions
 #    - Generate UI dynamically based on data
 #    - Graceful degradation when data is missing

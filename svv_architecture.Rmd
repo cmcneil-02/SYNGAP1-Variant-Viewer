@@ -88,12 +88,13 @@ Filter removes all data? → Show empty track, explain
 
 #### 5. **Cache Everything Expensive**
 ```
-API calls → Cached to disk (permanent)
-Parsed data → Computed once (session)
-Filtered data → Reactive (auto-cached)
+Ensembl API calls → Cached to disk permanently (coordinates never change)
+ClinVar API calls → Cached to disk with 7-day expiry (submissions do change)
+Parsed data       → Computed once (session)
+Filtered data     → Reactive (auto-cached)
 ```
 
-**Why:** 150x performance improvement. Works offline. Reduces server load.
+**Why:** 150x performance improvement for Ensembl lookups. ClinVar stays current without a manual re-download. Works offline between refreshes. Reduces external API load.
 
 ---
 
@@ -106,8 +107,15 @@ Filtered data → Reactive (auto-cached)
 └─────────────────────────────────────────────────────────────────────┘
 
 1. Load Libraries
-   ├─ shiny, igvShiny, dplyr, stringr, httr, jsonlite, memoise
+   ├─ shiny, igvShiny, dplyr, stringr, httr, jsonlite, memoise, cachem, shinyWidgets
    └─ Why: Each provides specific functionality
+
+1B. Fetch ClinVar Data (NCBI E-utilities)
+   ├─ Check cache/clinvar/last_updated.txt
+   ├─ If cache < 7 days old → load clinvar_data.rds instantly
+   ├─ Otherwise → esearch SYNGAP1[gene] → esummary in batches of 200
+   ├─ Save to cache/clinvar/ with timestamp
+   └─ Fallback: stale cache if fetch fails; empty frame if no cache at all
 
 2. Load CSV Data (updatedCitizen191.csv)
    ├─ 153 variants × 33 columns
@@ -124,7 +132,7 @@ Filtered data → Reactive (auto-cached)
    └─ Uses regex parsing
 
 5. Convert Coordinates to Genome Positions
-   ├─ Query Ensembl API (with caching!)
+   ├─ Query Ensembl API (with permanent disk cache)
    ├─ cDNA 333 → chr6:33,425,796
    ├─ First run: 143 API calls (~40 sec)
    └─ Later runs: 143 cache reads (~0.3 sec)
@@ -141,6 +149,9 @@ Filtered data → Reactive (auto-cached)
    ├─ Initialize UI
    ├─ Initialize IGV browser
    └─ Wait for user interaction
+
+First-run total: ~70–120 seconds (ClinVar fetch ~30–60 sec + Ensembl ~40–60 sec)
+Subsequent runs: < 2 seconds (both caches warm)
 ```
 
 ### User Interaction Sequence
@@ -160,7 +171,29 @@ Scenario 1: User clicks "missense" button
 7. Center view on SYNGAP1 gene
 8. Track appears on screen
 
-Scenario 2: User checks "Has biorepository samples"
+Scenario 2: User clicks "ClinVar" button
+─────────────────────────────────────────
+1. observeEvent fires
+2. Set clinvar_track_added(TRUE)
+3. Read current slider value (input$clinvar_size_kb), default 100 KB
+4. Call create_clinvar_gff3_data(clinvar_data, max_size_kb = 100)
+   ├─ Filter out variants with no GRCh38 coordinates
+   ├─ Filter out variants whose span > 100 KB
+   └─ Format remaining variants as GFF3
+5. Load teal ClinVar track into IGV
+6. Center view on SYNGAP1 gene
+7. Track appears on screen
+
+Scenario 3: User moves ClinVar size slider to 10 KB
+──────────────────────────────────────────────────────
+1. observeEvent(input$clinvar_size_kb) fires
+2. Check clinvar_track_added() — TRUE, so continue
+3. Re-call create_clinvar_gff3_data(clinvar_data, max_size_kb = 10)
+   └─ Fewer variants pass the span filter
+4. Reload ClinVar track (replaces existing track, no flicker)
+5. Track updates instantly to show only variants ≤ 10 KB
+
+Scenario 4: User checks "Has biorepository samples"
 ─────────────────────────────────────────────────────
 1. Checkbox input changes
 2. filtered_data() reactive recalculates
@@ -169,10 +202,11 @@ Scenario 2: User checks "Has biorepository samples"
    └─ Return subset
 3. trackButtons UI regenerates (different variant types available)
 4. observeEvent for filtered_data() fires
-5. All visible tracks reload with filtered data
+5. All visible internal tracks reload with filtered data
 6. IGV updates (some variants disappear)
+7. ClinVar track is unaffected (independent of these filters)
 
-Scenario 3: User checks "Cell line available" too
+Scenario 5: User checks "Cell line available" too
 ──────────────────────────────────────────────────
 1. Second checkbox changes
 2. filtered_data() reactive recalculates again
@@ -188,33 +222,39 @@ Scenario 3: User checks "Cell line available" too
 
 ## Component Breakdown
 
-### Layer 1: Data Processing (Lines 1-172)
+### Layer 1: Data Processing
 
-**Purpose:** Transform raw CSV into visualization-ready format
+**Purpose:** Transform raw CSV into visualization-ready format; fetch and cache external reference data
 
 **Components:**
 
-1. **Amino Acid Converter** (`swap_one_letter_to_three_letter`)
+1. **ClinVar Fetcher** (`fetch_clinvar_ids`, `fetch_clinvar_summaries`, `load_clinvar_data`)
+   - Input: NCBI E-utilities API (esearch + esummary)
+   - Output: `clinvar_data` data frame (~1,900 variants with GRCh38 coordinates)
+   - Cache: `cache/clinvar/clinvar_data.rds` — expires after 7 days
+   - Why: Keeps ClinVar reference data current without manual updates
+
+2. **Amino Acid Converter** (`swap_one_letter_to_three_letter`)
    - Input: `"R135X"`
    - Output: `"Arg135ter"`
    - Why: Readability for biologists
 
-2. **Coordinate Extractor** (`extract_cDNA_coordinate`)
+3. **Coordinate Extractor** (`extract_cDNA_coordinate`)
    - Input: `"c.333del"`
    - Output: `333`
    - Why: Need numeric value for API query
 
-3. **API Client** (`get_genome_positions_function`)
+4. **API Client** (`get_genome_positions_function`)
    - Input: cDNA coordinate `333`
    - Output: `list(seqid="chr6", start=33425796, end=33425796)`
    - Why: IGV needs genome coordinates, not cDNA
 
-4. **Cache Wrapper** (`memoise`)
+5. **Cache Wrapper** (`memoise`)
    - Wraps: `get_genome_positions_function`
-   - Effect: Saves results to disk, reads from disk on subsequent calls
+   - Effect: Saves results to disk permanently, reads from disk on subsequent calls
    - Why: 150x performance boost, offline capability
 
-5. **Data Loader**
+6. **Data Loader**
    - Reads CSV
    - Normalizes variant types
    - Extracts coordinates
@@ -222,7 +262,7 @@ Scenario 3: User checks "Cell line available" too
    - Merges results
    - Creates complete dataset
 
-### Layer 2: User Interface (Lines 187-229)
+### Layer 2: User Interface
 
 **Purpose:** Visual layout and controls
 
@@ -234,7 +274,9 @@ Scenario 3: User checks "Cell line available" too
 
 2. **Sidebar Panel**
    - Dynamic variant type buttons (generated by server)
-   - Three filter checkboxes (static)
+   - Static ClinVar track button (below a divider)
+   - Log-spaced size filter slider for ClinVar (1–50,000 KB, default 100 KB)
+   - Three research asset filter checkboxes
    - Compact width (30% of screen)
 
 3. **Main Panel**
@@ -255,6 +297,10 @@ Scenario 3: User checks "Cell line available" too
 │  [missense]  │                         │
 │  [nonsense]  │      IGV Browser        │
 │  [frameshift]│      (Genome View)      │
+│  ...         │                         │
+│ ──────────── │                         │
+│  [ClinVar]   │                         │
+│  |~~~size~~| │                         │
 │              │                         │
 │  □ Biorepository                       │
 │  □ Cell line │                         │
@@ -264,39 +310,56 @@ Scenario 3: User checks "Cell line available" too
   30% width         70% width
 ```
 
-### Layer 3: Server Logic (Lines 266-398)
+### Layer 3: Server Logic
 
 **Purpose:** Reactive programming that connects UI to data
 
 **Components:**
 
-1. **State Manager** (`added_tracks`)
-   - Tracks which buttons user has clicked
+1. **Internal Track State Manager** (`added_tracks`)
+   - Tracks which variant-type buttons user has clicked
    - Persists across filter changes
    - Type: `reactiveVal(list())`
 
-2. **Data Filter** (`filtered_data`)
+2. **ClinVar Track State Manager** (`clinvar_track_added`)
+   - Separate flag for whether the ClinVar track is currently displayed
+   - Prevents the size slider observer from firing before the track exists
+   - Type: `reactiveVal(FALSE)`
+
+3. **Data Filter** (`filtered_data`)
    - Reactive expression
    - Recomputes when any filter checkbox changes
    - Returns: Subset of variant_data matching all active filters
+   - Note: Does not affect ClinVar data (independent reference dataset)
 
-3. **Button Generator** (`output$trackButtons`)
+4. **Button Generator** (`output$trackButtons`)
    - Reactive UI
    - Creates buttons based on filtered variant types
    - Updates when filters change
 
-4. **Track Loader** (`observe` with button events)
-   - Listens for button clicks
+5. **Internal Track Loader** (`observe` with button events)
+   - Listens for variant-type button clicks
    - Converts data to GFF3 format
    - Loads track into IGV
    - Handles empty data gracefully
 
-5. **Track Updater** (`observeEvent(filtered_data())`)
+6. **ClinVar Track Loader** (`observeEvent(input$addTrack_clinvar)`)
+   - Listens for ClinVar button click
+   - Sets `clinvar_track_added(TRUE)`
+   - Calls `create_clinvar_gff3_data()` with current slider value
+   - Loads teal ClinVar track into IGV
+
+7. **ClinVar Size Slider Handler** (`observeEvent(input$clinvar_size_kb)`)
+   - Fires when user moves the size filter slider
+   - No-op if `clinvar_track_added()` is FALSE (track not yet displayed)
+   - Re-builds GFF3 with new KB threshold and reloads track live
+
+8. **Track Updater** (`observeEvent(filtered_data())`)
    - Watches for filter changes
-   - Reloads all visible tracks with new filtered data
+   - Reloads all visible internal tracks with new filtered data
    - Keeps display in sync with filters
 
-6. **IGV Initializer** (`output$igvShiny_0`)
+9. **IGV Initializer** (`output$igvShiny_0`)
    - Sets up genome browser on startup
    - Configures genome (hg38)
    - Sets initial view (SYNGAP1)
@@ -504,6 +567,23 @@ Result: Maintainable, documented application
 Learning: Documentation is essential!
 ```
 
+### Phase 7: ClinVar Integration & Size Filter
+```
+Goal: Add live ClinVar reference data alongside internal variants
+Approach: NCBI E-utilities API with time-limited cache
+Result: Toggleable ClinVar track with log-spaced size filter slider
+Learning: Two caches with different lifetimes need different strategies!
+```
+
+**Added:**
+- Live ClinVar fetch via NCBI esearch + esummary (batched, rate-limited)
+- 7-day time-limited cache (`cache/clinvar/`) with stale-cache fallback
+- `create_clinvar_gff3_data()` with `max_size_kb` parameter
+- Static ClinVar button (separate from dynamic variant-type loop)
+- `clinvar_track_added` state flag to gate the slider observer
+- `shinyWidgets::sliderTextInput()` with log-spaced stops (1–50,000 KB)
+- Live track reload on slider change
+
 ---
 
 ## Common Patterns Used
@@ -621,8 +701,9 @@ swap_one_letter_to_three_letter <- function(protein_change_str) {
         │                                     │
    Load CSV ────────────────────────→  Display Controls
    Parse Variants                       Show IGV Browser
-   Query API (cached!) ←────────────  User Clicks Button
-   Format Data                          User Checks Filter
+   Query Ensembl (cached!) ←────────  User Clicks Button
+   Fetch ClinVar (7-day cache!)         User Checks Filter
+   Format Data              ←────────  User Moves Slider
         │                                     │
         └──────────────────┬──────────────────┘
                            ↓
@@ -634,6 +715,10 @@ swap_one_letter_to_three_letter <- function(protein_change_str) {
    Filter Data      Generate UI        Load Tracks
    (reactive())   (renderUI())    (observeEvent())
         │                  │                  │
+        │                  │       ┌──────────┴──────────┐
+        │                  │  Internal tracks       ClinVar track
+        │                  │  (filtered by          (filtered by
+        │                  │   checkboxes)           size slider)
         └──────────────────┴──────────────────┘
                            ↓
                     User sees updated view
@@ -641,7 +726,7 @@ swap_one_letter_to_three_letter <- function(protein_change_str) {
 ```
 
 **Key Insight:** 
-The app is a pipeline where data flows from CSV → Processing → Cache → Reactive system → IGV display. User interactions trigger reactive updates that flow through the same pipeline, but use cached data for instant response.
+The app maintains two parallel data pipelines: internal variant data flows from CSV → Ensembl API → reactive filter → GFF3 → IGV, while ClinVar data flows from NCBI API → 7-day cache → size filter → GFF3 → IGV. Both pipelines share the same IGV browser but are controlled independently — internal tracks respond to research-asset checkboxes, while the ClinVar track responds only to its own button and size slider.
 
 **Success Criteria:**
 ✅ Fast (< 1 second load time after first run)
@@ -654,7 +739,7 @@ The app is a pipeline where data flows from CSV → Processing → Cache → Rea
 
 ## Next Steps for Understanding
 
-1. **Read the commented code** (`app_COMMENTED.R`)
+1. **Read the commented code** (`svv_app_v2_1.R`)
    - Start at top, read section by section
    - Each function has detailed explanation
 

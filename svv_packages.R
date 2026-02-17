@@ -21,7 +21,7 @@ if (!check_package("BiocManager")) {
 
 # 2. Install CRAN packages
 cat("\nStep 2/4: Installing CRAN packages...\n")
-cran_packages <- c("shiny", "dplyr", "stringr", "httr", "jsonlite", "memoise", "cachem")
+cran_packages <- c("shiny", "dplyr", "stringr", "httr", "jsonlite", "memoise", "cachem", "shinyWidgets")
 
 for (pkg in cran_packages) {
   if (!check_package(pkg)) {
@@ -41,13 +41,19 @@ if (!check_package("igvShiny")) {
   cat("  igvShiny already installed ✓\n")
 }
 
-# 4. Create cache directory
-cat("\nStep 4/4: Creating cache directory...\n")
+# 4. Create cache directories
+cat("\nStep 4/4: Creating cache directories...\n")
 if (!dir.exists("cache/genome_positions")) {
   dir.create("cache/genome_positions", recursive = TRUE)
   cat("  Created cache/genome_positions/ ✓\n")
 } else {
-  cat("  Cache directory already exists ✓\n")
+  cat("  cache/genome_positions/ already exists ✓\n")
+}
+if (!dir.exists("cache/clinvar")) {
+  dir.create("cache/clinvar", recursive = TRUE)
+  cat("  Created cache/clinvar/ ✓\n")
+} else {
+  cat("  cache/clinvar/ already exists ✓\n")
 }
 
 # Verify installation
@@ -55,7 +61,7 @@ cat("\n========================================\n")
 cat("Installation Complete! Verifying...\n")
 cat("========================================\n\n")
 
-required_packages <- c("shiny", "igvShiny", "dplyr", "stringr", "httr", "jsonlite", "memoise")
+required_packages <- c("shiny", "igvShiny", "dplyr", "stringr", "httr", "jsonlite", "memoise", "shinyWidgets")
 all_installed <- TRUE
 
 for (pkg in required_packages) {
